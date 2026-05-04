@@ -1,0 +1,54 @@
+name: KB보험료 수집
+
+on:
+  schedule:
+    - cron: '0 1 * * 1'   # 매주 월요일 오전 10시 KST (UTC 01:00)
+  workflow_dispatch:
+    inputs:
+      products:
+        description: '상품코드 (공백 구분, 예: 24953 24954)'
+        required: false
+        default: '24953 24954 24957 24958'
+      ages:
+        description: '나이 목록 (공백 구분, 예: 30 40 50)'
+        required: false
+        default: ''
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 패키지 설치
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: 보험료 수집
+        run: |
+          PRODUCTS="${{ github.event.inputs.products || '24953 24954 24957 24958' }}"
+          AGES="${{ github.event.inputs.ages }}"
+
+          ARGS="--products $PRODUCTS"
+          if [ -n "$AGES" ]; then
+            ARGS="$ARGS --ages $AGES"
+          fi
+
+          python3 kb_collect.py $ARGS
+
+      - name: 결과 업로드
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kb-보험료-${{ github.run_id }}
+          path: kb_보험료_*.xlsx
+          retention-days: 90
