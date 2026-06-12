@@ -442,9 +442,18 @@ async def get_premium(apcno: str, pdcd: str, cfg: dict, cond: dict, cvr_list: li
     batches = [send_cvrs[i:i+batch_size] for i in range(0, len(send_cvrs), batch_size)]
     sem = asyncio.Semaphore(CONCURRENCY)
 
+    # batch_size==1(맞춤고지 단독산출) 경로는 동시 부하에서 간헐적 null 이 나올 수 있어
+    # 빈 결과면 최대 2회 재시도. (배치≥2 상품은 null 이 담보충돌 등 정상 사유라 재시도 안 함)
+    null_retry = 2 if batch_size == 1 else 0
+
     async def bounded(batch):
         async with sem:
-            return await _call_prem_batch(apcno, pdcd, cfg, cond, batch)
+            r = await _call_prem_batch(apcno, pdcd, cfg, cond, batch)
+            for _ in range(null_retry):
+                if r and "_error" not in r:
+                    break
+                r = await _call_prem_batch(apcno, pdcd, cfg, cond, batch)
+            return r
 
     results = await asyncio.gather(*[bounded(b) for b in batches])
     combined = {}
