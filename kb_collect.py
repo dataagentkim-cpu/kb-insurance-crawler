@@ -96,8 +96,33 @@ PRODUCT_CONFIGS = {
                            ("03", "20", "20", "1", "20년납/20년만기(갱신형)"),
                            ("04", "30", "30", "1", "30년납/30년만기(갱신형)")],
         "excl_renewal":   False,   # 담보가 전부 갱신형 — 제외하면 안 됨
+        "cvr_prefixes":   ("LB",), # 맞춤고지 담보는 LB prefix
         # 배치로 보내면 상호배타 담보끼리 서로 null 처리됨(배치20=200개·배치1=384개).
         # 기본 사망/후유장해까지 빠지므로 담보별 단독 산출(배치1)로 정확도 확보.
+        "batch_size":     1,
+    },
+    # ── KB 5.10.10 플러스 세만기(맞춤고지) ────────────────────────
+    # 24995 와 게이트(ltigen="00"·ltiord="00")는 동일하나 세만기(insMtrtyCfcd="2")
+    # 전용이고, 보험료 담보가 전부 LA prefix(401개 중 390개 산출).
+    # 만기는 90세·100세만 유효(95세는 전부 null), 95세 제외.
+    "24999": {
+        "name":           "세만기(맞춤고지)",
+        "comprDesignCfcd":"05",
+        "napim":          [("00", "납입면제미적용형")],
+        "simsa":          [("00", "맞춤고지")],
+        "plans":          [("02", "맞춤고지형")],
+        "cvr_prefixes":   ("LA",),  # 세만기 보험료 담보는 LA prefix
+        "periods":        [("01", "10", "90", "2", "10년납/90세만기"),
+                           ("01", "10", "A0", "2", "10년납/100세만기"),
+                           ("02", "15", "90", "2", "15년납/90세만기"),
+                           ("02", "15", "A0", "2", "15년납/100세만기"),
+                           ("03", "20", "90", "2", "20년납/90세만기"),
+                           ("03", "20", "A0", "2", "20년납/100세만기"),
+                           ("",   "25", "90", "2", "25년납/90세만기"),
+                           ("",   "25", "A0", "2", "25년납/100세만기"),
+                           ("04", "30", "90", "2", "30년납/90세만기"),
+                           ("04", "30", "A0", "2", "30년납/100세만기")],
+        "excl_renewal":   False,
         "batch_size":     1,
     },
 }
@@ -370,7 +395,12 @@ async def get_premium(apcno: str, pdcd: str, cfg: dict, cond: dict, cvr_list: li
     excl_renewal = cfg.get("excl_renewal", False)
     ltiord = cond.get("ltiordCd", "14")
 
-    if ltiord == "00":
+    # 상품별 담보 prefix override (없으면 ltiord 기준 LB/LE 자동판정)
+    #   24995(연만기 맞춤고지)=LB, 24999(세만기 맞춤고지)=LA 등
+    cvr_prefixes = cfg.get("cvr_prefixes")
+    if cvr_prefixes:
+        prefix_ok = lambda cd: cd.startswith(tuple(cvr_prefixes))
+    elif ltiord == "00":
         prefix_ok = lambda cd: cd.startswith("LB")
     else:
         prefix_ok = lambda cd: cd.startswith("LE")
