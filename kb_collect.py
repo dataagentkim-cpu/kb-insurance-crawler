@@ -79,6 +79,27 @@ PRODUCT_CONFIGS = {
         "periods":        _SE_PERIODS,
         "excl_renewal":   True,
     },
+    # ── KB 5.10.10 플러스 (맞춤고지방식) ──────────────────────────
+    # 24953/57 계열과 구조가 다름: 담보가 전부 LB(맞춤고지) 하나뿐이라
+    # 간편/일반 심사 구분도, 납입면제 리더(rider)도 없다.
+    # 보험료가 산출되는 유일한 경로:
+    #   comprDesignCfcd="05"(맞춤고지) · ltiordCd="00" · ltigenCd="00"(납면미적용)
+    # comprDesignCfcd("05"/"01"/"04")·plan(lngtrmContTdcd)은 보험료에 영향 없음 → 고정.
+    # 그래서 simsa/napim/plans 를 각각 1개로 override 해 단일 경로만 순회한다.
+    "24995": {
+        "name":           "연만기갱신형(맞춤고지)",
+        "comprDesignCfcd":"05",
+        "napim":          [("00", "납입면제미적용형")],            # ltigenCd="00" 만 유효
+        "simsa":          [("00", "맞춤고지")],                    # ltiordCd="00" 만 유효 → LB prefix
+        "plans":          [("02", "맞춤고지형")],                  # 보험료 무관, 중복 방지용 단일값
+        "periods":        [("01", "10", "10", "1", "10년납/10년만기(갱신형)"),
+                           ("03", "20", "20", "1", "20년납/20년만기(갱신형)"),
+                           ("04", "30", "30", "1", "30년납/30년만기(갱신형)")],
+        "excl_renewal":   False,   # 담보가 전부 갱신형 — 제외하면 안 됨
+        # 배치로 보내면 상호배타 담보끼리 서로 null 처리됨(배치20=200개·배치1=384개).
+        # 기본 사망/후유장해까지 빠지므로 담보별 단독 산출(배치1)로 정확도 확보.
+        "batch_size":     1,
+    },
 }
 
 # ── 공통 상수 ─────────────────────────────────────────────────
@@ -387,7 +408,8 @@ async def get_premium(apcno: str, pdcd: str, cfg: dict, cond: dict, cvr_list: li
     if not send_cvrs:
         return {}
 
-    batches = [send_cvrs[i:i+BATCH_SIZE] for i in range(0, len(send_cvrs), BATCH_SIZE)]
+    batch_size = cfg.get("batch_size", BATCH_SIZE)
+    batches = [send_cvrs[i:i+batch_size] for i in range(0, len(send_cvrs), batch_size)]
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async def bounded(batch):
@@ -407,14 +429,16 @@ def build_conditions(pdcd: str, cfg: dict, ages: list[int]) -> list[dict]:
     """조건 조합 목록 생성"""
     conds = []
     napim_list = cfg["napim"]
+    simsa_list = cfg.get("simsa", SIMSA)   # 상품별 심사고지유형 override (기본: 전역 SIMSA)
+    plan_list  = cfg.get("plans", PLAN)    # 상품별 플랜 override (기본: 전역 PLAN)
 
     for sex_cd, sex_nm in SEXES:
         for age in ages:
             for ocpt_cd, ocpt_nm, rg, rc, jg in OCCUPATIONS:
                 for driv_cd, driv_nm in DRIVS:
-                    for simsa_cd, simsa_nm in SIMSA:
+                    for simsa_cd, simsa_nm in simsa_list:
                         for napim_cd, napim_nm in napim_list:
-                            for plan_cd, plan_nm in PLAN:
+                            for plan_cd, plan_nm in plan_list:
                                 allowed = (SIMSA_PLAN_ALLOW.get(simsa_cd, set()) &
                                            NAPIM_PLAN_ALLOW.get(napim_cd, set()))
                                 if plan_cd not in allowed:

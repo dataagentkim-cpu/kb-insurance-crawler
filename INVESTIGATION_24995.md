@@ -1,99 +1,81 @@
-# 24995 보험료 수집 조사 결과
+# 24995 보험료 수집 — 해결 완료 ✅
 
-## 목표
-KB 5.10.10 플러스 건강보험 (pdcd: 24995=연만기갱신형, 24999=세만기)를 kb_collect.py에 추가
+KB 5.10.10 플러스 **연만기갱신형(맞춤고지)** 상품(pdcd=24995)을 `kb_collect.py`에 추가 완료.
+`python kb_collect.py --products 24995` 로 수집된다.
 
-## 기존 작동 상품
-- 24953/24954/24957/24958 → LTI0103805 배치 계산 정상 작동
+## 핵심 원인 (이전 가설은 틀렸음)
 
-## 24995 핵심 파라미터 차이
+이전 조사는 `comprDesignCfcd="05"(맞춤고지방식)` 를 서버가 미지원하는 게 원인이라고 봤지만 **오답**이었다.
+파라미터 스윕 결과 보험료가 산출되는 유일한 조건은 다음 2개였다:
 
-| 항목 | 24953 (작동) | 24995 (문제) |
-|------|-------------|-------------|
-| comprDesignCfcd | "01" | "05" (맞춤고지방식) |
-| smplComprPrdtCfcd | "10" | null/"" |
-| LTI0103805 결과 | 보험료 정상 | achngCvrPrem=null |
+| 파라미터 | 값 | 비고 |
+|---------|----|----|
+| **ltigenCd** | **"00"** | 납입면제 미적용. 04/11/14 등 어떤 납입면제 리더든 → `achngCvrPrem=null` |
+| **ltiordCd** | **"00"** | 맞춤고지 단일 경로. 03/14/15/16/17 등 → null |
 
-## 조사한 API들
+즉 24995는 **납입면제 리더도, 간편/일반 심사 구분도 없는** 단일 고지방식 상품이다.
 
-### LTI0103805 (배치 보험료 계산)
-- 24953: comprDesignCfcd="01" → 정상 (LB0001=270원 등)
-- 24995: comprDesignCfcd="05" → achngCvrPrem=null 반환
-- **원인 불명** — 서버가 comprDesignCfcd="05"를 지원 안 하는 것으로 추정
+보험료에 **영향 없는** 파라미터 (값 바꿔도 동일 → 고정/중복방지):
+- `comprDesignCfcd` ("05"/"01"/"04" 모두 동일 보험료)
+- `lngtrmContTdcd`(플랜) ("01"/"02"/"11" 모두 동일)
 
-### LTI0103804 (단일 담보 실시간 계산)
-- 24995 LB 담보: achngCvrPrem="0" 반환
-- rtimePremCalYn: null (LTI0100403 초기값), saveIntroInfo 후 값 변화 미확인
+보험료를 **바꾸는** 축: 성별 · 나이 · 납기/만기 · 담보.
 
-### LTI0104701 (유사 상품 설계 비교)
-- sumPrem=0, 담보 데이터 없음
-- stndApcno + pdcd="24995" + cvrComprYn="Y" 조합으로 호출해도 동일
+## 상품 구조 (24953 과 다름)
 
-### getApcComprDesignPremCalc (APP_CT 경로, devon=false)
-- sumPrem=0, cvrCount=0
-- apcno에 담보 정보가 없어서인 것으로 추정
+| | 24953(작동 기존) | 24995 |
+|--|----------------|-------|
+| 담보 prefix | LB(일반) 387 + LE(간편) 387 | **LB(맞춤고지) 445 뿐** (LE 없음) |
+| 보험료 산출 경로 | LE + 간편심사(ltiord=14) | LB + ltiord=00 + ltigen=00 |
 
-## UI 마법사 흐름 분석
+`get_premium()` 의 기존 로직(`ltiord=="00" → LB prefix`)이 그대로 들어맞아 엔진 수정은 불필요했다.
 
-CT01_0495M: Step 1 (피보험자/조건) → Step 2 (담보 선택) → Step 3 (보험료 확인)
+## 유효 납기/만기 (연만기갱신형, insMtrtyCfcd="1")
 
-### saveIntroInfo() 결과
-- apcno 생성 성공 (예: RQ2638844719)
-- _currentNaviIndex: 1 (Step 2로 이동)
-- **페이지 네비게이션 발생** — 새 프레임을 잡아야 함
+| 조합 | ltifmCd | 결과 |
+|------|---------|------|
+| 10납/10만기 | "01" | ✅ |
+| 20납/20만기 | "03" | ✅ |
+| 30납/30만기 | "04" | ✅ |
+| 05/05, 15/15, 납기≠만기 | — | ✗ null |
+| 세만기(insMtrtyCfcd="2") | — | ✗ null (→ 별도 상품 24999 영역) |
 
-### Step 2 문제
-- `ds_ltApcCvrInfoDTO`: 456개 담보 (ds.setCellData로 cvrNtrCkYn='1' 설정 가능)
-- `fds_ltApcCvrInfoDTO`: 395개 담보 (필터된 뷰)
-- **핵심 버그**: ds에서 setCellData로 설정한 값이 fds에 반영 안 됨
-  - ds에서 5개 담보 선택 → dsChecked=5, fdsChecked=0
-- calRtimeCvrPrem은 fds를 하드코딩으로 참조 → fds가 업데이트 안 되면 API 호출 없음
+## 배치 충돌 — 담보별 단독 산출(batch_size=1) 필요
 
-### procSave() 호출 시 오류
-- LTI0100101 호출 → errCode=0 but msg="저장이 완료되지 않았습니다"
-- saveApcInfo()가 LTI0100101을 먼저 호출함
+LTI0103805 에 여러 담보를 한 배치로 보내면 **상호배타 담보끼리 서로 null 처리**된다.
+기본 사망/후유장해(LB0001/LB0174)까지 빠져 데이터에 큰 구멍이 생김.
 
-## 미해결 문제
+| 배치 크기 | 보험료>0 담보 수 | 기본 사망/후유장해 |
+|----------|----------------|------------------|
+| 20 | 200 | ❌ 누락 |
+| 10 | 270 | ❌ |
+| 5 | 335 | ❌ |
+| **1** | **384** | ✅ |
 
-1. **fds에 ds 변경사항 반영 안 됨** — WebSquare FilterDataset 동작 방식 이해 필요
-   - fds에서 직접 setCellData 가능한지 미확인
-   - 이벤트 트리거로 fds 갱신 가능한지 미확인
+→ 24995 config 에 `"batch_size": 1` 추가. (담보를 단독으로 보내면 실제 단독 보험료가 나옴.)
+남는 ~61개 null 은 45세 전업주부 프로필에 실제로 해당 안 되는 담보(운전/연령전용 등)로 정상.
 
-2. **LTI0103805 comprDesignCfcd="05" 불지원** — 해결책 필요
-   - 옵션 A: comprDesignCfcd="01"로 강제 변경해서 테스트
-   - 옵션 B: Step 3 화면까지 완전 자동화해서 어떤 API가 호출되는지 캡처
-   - 옵션 C: 다른 API 경로 탐색 (아직 미발견)
+## kb_collect.py 변경 요약
 
-3. **LTI0100101 저장 실패** — UW 심사 관련 문제
-   - "청약안내_문제해결" 클릭 필요 → UI 자동화로 해결 가능할 수 있음
+1. `PRODUCT_CONFIGS["24995"]` 추가
+   - `comprDesignCfcd="05"`, `napim=[("00","납입면제미적용형")]`, `simsa=[("00","맞춤고지")]`,
+     `plans=[("02","맞춤고지형")]`, periods 3종(10/20/30 갱신형), `excl_renewal=False`, `batch_size=1`
+2. `build_conditions()` — 상품별 `simsa`/`plans` override 지원 (없으면 전역 SIMSA/PLAN)
+3. `_call_prem_batch` 호출부 — `cfg.get("batch_size", BATCH_SIZE)` 로 상품별 배치 크기
 
-## 다음 시도할 것
+## 검증 (2026-06-12, 45세 1나이)
 
-### 옵션 A (가장 빠름): comprDesignCfcd 강제 "01"
-```python
-# kb_collect.py에서 24995에 대해 comprDesignCfcd="01"로 테스트
-# 보험료 값이 나오면 실제 "05" 보험료와 동일한지 확인
-```
+- 조건 12개(성별2 × 운전2 × 납기만기3), 고유담보 390개, 보험료 null 0, 범위 4원~9,129,000원
+- LB0001 사망: 남 250원 / 여 130원 (10년납), 30년납 370원 — 성별·납기 따라 정상 변동
 
-### 옵션 B: fds에서 직접 setCellData 시도
-```javascript
-// Step 2에서 fds에 직접 설정
-const fds = window[prefix + '_fds_ltApcCvrInfoDTO'];
-fds.setCellData(0, 'cvrNtrCkYn', '1');  // 가능한지 미확인
-fds.setCellData(0, 'achngCvrTnthwnUnitNtramt', '1000');
-// → calRtimeCvrPrem이 호출되면 API 요청 캡처
-```
+## 후속 (선택)
 
-### 옵션 C: Step 3까지 완전 자동화
-- procSave() 내 LTI0100101 저장 완료 후 naviIndex=2(Step3)로 이동
-- Step 3에서 어떤 보험료 조회 API가 호출되는지 확인
+- **24999 (세만기 맞춤고지)**: 같은 방식으로 별도 config 필요. insMtrtyCfcd="2", 90/95/100세 만기 유효성 재확인 필요.
+- 다른 상품들도 배치 충돌로 일부 담보 누락 가능성 — 필요시 batch_size 조정 검토.
 
-## 코드 위치
-- `/Users/hanwha/kb-insurance-crawler/kb_collect.py` — 메인 수집기
-- `/Users/hanwha/kb-insurance-crawler/probe_24995v*.py` — 조사 스크립트들
-
-## CT01_0495M API 엔드포인트
-```
-GET https://ppa.kbinsure.co.kr/ppa/index_ws.jsp?gb=l&wsdl=ct_ui::CT01_0495M.xml&key1={pdcd}
-POST https://ppa.kbinsure.co.kr/po-21/APP_EG/SG_EG/WS/v1/APP_KI/DEVON/{fn}?envrflag=ws&region=PD&sysgb=GW&user_key=4265768632&apnm=APP_KI&svcnm=DEVON
-```
+## probe 스크립트
+- `probe_24995v14.py` — ltigen/ltiord 돌파구 스윕 (보험료 산출 조합 발견)
+- `probe_24995v15.py` — 보험료 변동 축 식별 (어떤 파라미터가 값에 영향?)
+- `probe_24995v16.py` — 유효 납기/만기 + 전체 담보 커버리지
+- `probe_24995v17.py` — 배치 크기별 산출 담보 수 비교
+- (v1~v7: 초기 탐색 / v8~v13: 중간 스윕은 정리됨)
