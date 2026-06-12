@@ -134,7 +134,7 @@ def _make_req_json(fn_name: str, body: dict) -> str:
                       ensure_ascii=False)
 
 
-async def _call_api(fn_name: str, body: dict) -> dict:
+async def _call_api(fn_name: str, body: dict, _retries: int = 3) -> dict:
     url = f"{API_ORIG}/po-21/APP_EG/SG_EG/WS/v1/APP_KI/DEVON/{fn_name}?{API_QUERY}"
     req_json = _make_req_json(fn_name, body)
     script = f"""
@@ -148,7 +148,17 @@ async def _call_api(fn_name: str, body: dict) -> dict:
         try {{ return JSON.parse(text); }} catch(e) {{ return {{_raw: text}}; }}
     }}
     """
-    return await _page.evaluate(script) or {}
+    for attempt in range(_retries):
+        try:
+            return await _page.evaluate(script) or {}
+        except Exception as e:
+            if attempt < _retries - 1:
+                wait = 5 * (attempt + 1)
+                print(f"  ⚠ {fn_name} fetch 실패 (시도 {attempt+1}/{_retries}), {wait}초 후 재시도: {e}")
+                await asyncio.sleep(wait)
+            else:
+                raise
+    return {}
 
 
 async def init_session(pdcd: str):
