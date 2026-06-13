@@ -1,0 +1,49 @@
+name: KB보험료 전체수집(1회성)
+
+# 6개 상품을 상품별 병렬 잡으로 전량 수집. 슬립 걱정 없는 클라우드 실행.
+# 각 잡이 자기 상품 엑셀을 아티팩트로 업로드 → 모아서 병합.
+on:
+  workflow_dispatch:
+    inputs:
+      ages:
+        description: '나이 목록 (공백 구분, 비우면 20~70 5세 단위)'
+        required: false
+        default: ''
+
+jobs:
+  collect:
+    strategy:
+      fail-fast: false
+      matrix:
+        product: ["24953", "24954", "24957", "24958", "24995", "24999"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 패키지 설치
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: 보험료 수집 (${{ matrix.product }})
+        run: |
+          ARGS="--products ${{ matrix.product }}"
+          if [ -n "${{ github.event.inputs.ages }}" ]; then
+            ARGS="$ARGS --ages ${{ github.event.inputs.ages }}"
+          fi
+          python3 kb_collect.py $ARGS
+
+      - name: 결과 업로드
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kb-보험료-${{ matrix.product }}
+          path: kb_보험료_*.xlsx
+          retention-days: 90
