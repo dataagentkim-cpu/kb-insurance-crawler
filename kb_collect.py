@@ -167,7 +167,27 @@ CONCURRENCY = 10
 _prohead_tpl: dict = {}
 _syshead_tpl: dict = {}
 _treat_org:   dict = {}
+_playwright         = None
+_browser            = None
 _page               = None
+_current_pdcd       = None
+_call_count         = 0
+_session_gen        = 0          # 브라우저 재시작/재생성 세대 카운터
+_session_lock       = None       # 재시작 직렬화용 (이벤트루프 안에서 생성)
+
+
+def _get_session_lock():
+    global _session_lock
+    if _session_lock is None:
+        _session_lock = asyncio.Lock()
+    return _session_lock
+
+# 장시간 실행 시 렌더러가 점차 응답불능(hang)이 되는 문제 대응:
+#  - 모든 evaluate 를 hard timeout 으로 감싸 어떤 호출도 영원히 멈추지 않게
+#  - 실패가 누적되면 브라우저 전체 재시작
+#  - 일정 호출마다 page 를 재생성해 렌더러 메모리 누수 예방
+EVAL_TIMEOUT_S = 45
+RECYCLE_EVERY  = 5000
 
 
 def _make_req_json(fn_name: str, body: dict) -> str:
@@ -180,41 +200,9 @@ def _make_req_json(fn_name: str, body: dict) -> str:
                       ensure_ascii=False)
 
 
-async def _call_api(fn_name: str, body: dict, _retries: int = 3) -> dict:
-    url = f"{API_ORIG}/po-21/APP_EG/SG_EG/WS/v1/APP_KI/DEVON/{fn_name}?{API_QUERY}"
-    req_json = _make_req_json(fn_name, body)
-    script = f"""
-    async () => {{
-        const resp = await fetch({json.dumps(url)}, {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: {json.dumps(req_json)},
-        }});
-        const text = await resp.text();
-        try {{ return JSON.parse(text); }} catch(e) {{ return {{_raw: text}}; }}
-    }}
-    """
-    for attempt in range(_retries):
-        try:
-            return await _page.evaluate(script) or {}
-        except Exception as e:
-            if attempt < _retries - 1:
-                wait = 5 * (attempt + 1)
-                print(f"  ⚠ {fn_name} fetch 실패 (시도 {attempt+1}/{_retries}), {wait}초 후 재시도: {e}")
-                await asyncio.sleep(wait)
-            else:
-                raise
-    return {}
-
-
-async def init_session(pdcd: str):
-    """브라우저 열기 + PROHEAD/SYSHEAD/TreatOrg 캡처"""
-    global _prohead_tpl, _syshead_tpl, _treat_org, _page
-
-    p = await async_playwright().start()
-    browser = await p.chromium.launch(headless=True)
-    _page = await browser.new_page()
-
+async def _capture_session(pdcd: str):
+    """현재 _page 에서 제품 페이지로 이동 후 PROHEAD/SYSHEAD/TreatOrg 캡처"""
+    global _prohead_tpl, _syshead_tpl, _treat_org
     captured = {}
 
     async def on_response(resp):
@@ -232,12 +220,14 @@ async def init_session(pdcd: str):
             pass
 
     _page.on("response", on_response)
-
     url = f"{API_ORIG}/ppa/index_ws.jsp?gb=l&wsdl=ct_ui::CT01_0495M.xml&key1={pdcd}"
-    print(f"▶ 세션 초기화 ({pdcd})...")
     await _page.goto(url)
     await _page.wait_for_load_state("networkidle")
     await asyncio.sleep(2)
+    try:
+        _page.remove_listener("response", on_response)
+    except Exception:
+        pass
 
     if not captured.get("PROHEAD"):
         raise RuntimeError("PROHEAD 캡처 실패")
@@ -245,7 +235,6 @@ async def init_session(pdcd: str):
     _prohead_tpl = captured["PROHEAD"]
     _prohead_tpl["pfmFnCd"] = "CT01_0495M"
     _syshead_tpl = captured["SYSHEAD"]
-
     emp_no = _syshead_tpl.get("pfmEmpNo", "")
     org = captured.get("ORG", {})
     _treat_org = {
@@ -256,8 +245,122 @@ async def init_session(pdcd: str):
         "hqCd": org.get("hqCd", ""), "slctnOrgGrdCd": "02",
         "upOrgChngYn": None, "usInputObjcYn": None, "indcEmpNo": None, "indcNm": None,
     }
-    print(f"  ✓ 세션 (userId={_prohead_tpl.get('pfmUserId')}, empNo={emp_no})")
-    return browser
+
+
+async def _open_browser():
+    global _playwright, _browser, _page
+    _playwright = await async_playwright().start()
+    _browser = await _playwright.chromium.launch(headless=True)
+    _page = await _browser.new_page()
+
+
+async def _restart_session(reason: str = ""):
+    """브라우저를 완전히 닫고 재생성 + 세션 재캡처 (하드 실패 복구)"""
+    global _playwright, _browser, _page
+    print(f"  ↻ 브라우저 재시작 ({reason})")
+    for closer in (lambda: _browser.close(), lambda: _playwright.stop()):
+        try:
+            await closer()
+        except Exception:
+            pass
+    await _open_browser()
+    await _capture_session(_current_pdcd)
+
+
+async def _recycle_page():
+    """page 만 재생성해 렌더러 메모리 회수 (브라우저는 유지)"""
+    global _page
+    old = _page
+    _page = await _browser.new_page()
+    try:
+        await old.close()
+    except Exception:
+        pass
+    await _capture_session(_current_pdcd)
+
+
+_last_recycle_count = 0
+
+
+async def maybe_recycle():
+    """조건 경계(동시호출 없는 시점)에서 주기적 page 재생성 — hang 예방."""
+    global _last_recycle_count
+    if _call_count - _last_recycle_count >= RECYCLE_EVERY:
+        _last_recycle_count = _call_count
+        try:
+            await _recycle_page()
+            print(f"  ↻ page 재생성 (누적 {_call_count}콜)")
+        except Exception as e:
+            print(f"  ⚠ page 재생성 실패: {str(e)[:80]}")
+            try:
+                await _restart_session("recycle 실패 복구")
+            except Exception:
+                pass
+
+
+async def _call_api(fn_name: str, body: dict, _retries: int = 4) -> dict:
+    global _call_count
+    url = f"{API_ORIG}/po-21/APP_EG/SG_EG/WS/v1/APP_KI/DEVON/{fn_name}?{API_QUERY}"
+    req_json = _make_req_json(fn_name, body)
+    script = f"""
+    async () => {{
+        const resp = await fetch({json.dumps(url)}, {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: {json.dumps(req_json)},
+        }});
+        const text = await resp.text();
+        try {{ return JSON.parse(text); }} catch(e) {{ return {{_raw: text}}; }}
+    }}
+    """
+    _call_count += 1
+    for attempt in range(_retries):
+        gen = _session_gen
+        try:
+            # hard timeout — 어떤 호출도 영원히 멈추지 않게
+            return await asyncio.wait_for(_page.evaluate(script), timeout=EVAL_TIMEOUT_S) or {}
+        except Exception as e:
+            if attempt < _retries - 1:
+                wait = 5 * (attempt + 1)
+                print(f"  ⚠ {fn_name} 실패 (시도 {attempt+1}/{_retries}), {wait}초 후 재시도: {str(e)[:80]}")
+                await asyncio.sleep(wait)
+                # 2회째부터는 브라우저째 재시작 (동시 실패는 1회로 합쳐짐)
+                if attempt >= 1:
+                    await _guarded_recover(gen, recycle=False, reason=f"{fn_name} 연속 실패")
+            else:
+                raise
+    return {}
+
+
+async def _guarded_recover(seen_gen: int, recycle: bool, reason: str = "recycle"):
+    """세대(gen) 기준으로 재시작/재생성을 직렬화 — 동시 실패가 여러 번 재시작하지 않게."""
+    global _session_gen
+    async with _get_session_lock():
+        if _session_gen != seen_gen:
+            return  # 다른 호출이 이미 복구함
+        try:
+            if recycle:
+                await _recycle_page()
+            else:
+                await _restart_session(reason)
+        except Exception as e:
+            print(f"  ⚠ 복구 실패({'recycle' if recycle else 'restart'}): {str(e)[:80]}")
+            try:
+                await _restart_session("복구 재시도")
+            except Exception as e2:
+                print(f"  ⚠ 재시작도 실패: {str(e2)[:80]}")
+        _session_gen += 1
+
+
+async def init_session(pdcd: str):
+    """브라우저 열기 + PROHEAD/SYSHEAD/TreatOrg 캡처"""
+    global _current_pdcd
+    _current_pdcd = pdcd
+    print(f"▶ 세션 초기화 ({pdcd})...")
+    await _open_browser()
+    await _capture_session(pdcd)
+    print(f"  ✓ 세션 (userId={_prohead_tpl.get('pfmUserId')}, empNo={_syshead_tpl.get('pfmEmpNo','')})")
+    return _browser
 
 
 async def get_coverage_list(pdcd: str) -> list[dict]:
@@ -521,6 +624,8 @@ def save_excel(rows: list[dict], path: Path):
 
 async def collect_product(pdcd: str, ages: list[int], all_rows: list[dict]):
     """단일 상품 수집"""
+    global _current_pdcd
+    _current_pdcd = pdcd   # recycle/restart 시 올바른 제품 페이지로 재이동
     cfg = PRODUCT_CONFIGS[pdcd]
     print(f"\n▶ 상품 {pdcd} ({cfg['name']})")
 
@@ -535,15 +640,23 @@ async def collect_product(pdcd: str, ages: list[int], all_rows: list[dict]):
     for i, cond in enumerate(conds):
         cache_key = (pdcd, cond["sexCd"], cond["insAge"], cond["ocptCd"], cond["drivTdcd"])
 
-        if cache_key not in apcno_cache:
-            apcno = await create_apcno(pdcd, cfg, cond)
-            if not apcno:
-                print(f"  ⚠ apcno 생성 실패 {cache_key}, 스킵")
-                continue
-            apcno_cache[cache_key] = apcno
+        await maybe_recycle()   # 동시호출 없는 조건 경계에서만 재생성
 
-        apcno = apcno_cache[cache_key]
-        prems = await get_premium(apcno, pdcd, cfg, cond, cvr_list)
+        try:
+            if cache_key not in apcno_cache:
+                apcno = await create_apcno(pdcd, cfg, cond)
+                if not apcno:
+                    print(f"  ⚠ apcno 생성 실패 {cache_key}, 스킵")
+                    continue
+                apcno_cache[cache_key] = apcno
+
+            apcno = apcno_cache[cache_key]
+            prems = await get_premium(apcno, pdcd, cfg, cond, cvr_list)
+        except Exception as e:
+            # 재시도까지 소진된 하드 실패 — 해당 조건만 건너뛰고 계속
+            print(f"  ⚠ [{i+1}/{len(conds)}] 조건 처리 실패, 스킵: {str(e)[:80]}")
+            apcno_cache.pop(cache_key, None)   # 잠재적 오염 apcno 무효화
+            continue
 
         err = prems.get("_error")
         if err:
